@@ -1,0 +1,354 @@
+// Crochet de la machine virtuelle des scripts : CRunningScript::ProcessOneCommand (0x44FBE0) passe par nous
+// avant chaque opcode.
+//  - Invite : les missions de l'histoire ne se lancent jamais chez lui (START_MISSION 0417 est consomme sans effet) ;
+//    c'est l'hote qui les joue et qui en reproduit le contenu. Exception : les missions secondaires de vehicule
+//    (taxi, ambulance, pompiers, vigilante, livreur de pizza), qu'il joue seul chez lui.
+#include "util.h"
+#include "vccoop.h"
+#include "game.h"
+#include "mirror.h"
+#include "story_map.h"
+#include "conditions.h"
+#include "overlay.h"
+#include "net.h"
+#include "vehicles.h"
+#include <math.h>
+#include <string.h>
+
+using namespace game;
+
+typedef char(__fastcall *ProcessOneCommand_t)(void *script);
+static ProcessOneCommand_t o_ProcessOneCommand;   // trampoline : 7 octets d'origine puis jmp 0x44FBE7
+
+// CRunningScript::CollectParameters(int *ip, short count) : lit les parametres dans ScriptParams.
+static void CollectParameters(void *script, int count)
+{
+    ((void(__thiscall *)(void *, int *, short))0x451010)(script, &Field<int>(script, 0x10), (short)count);
+}
+
+enum { OP_TERMINATE_THIS_SCRIPT = 0x004E, OP_START_MISSION = 0x0417 };
+
+// --- Cinematiques et tenue F7 de personnage ---
+// Le jeu choisit le corps de Tommy dans une cinematique d'apres le nom du modele 0 : LOAD_SPECIAL_CHARACTER 'CSPlay'
+// (CStreaming::RequestSpecialModel) et LOAD_CUTSCENE (CAnimBlendAssocGroup::CreateAssociations, qui cherche le modele
+// de chaque animation) transforment un nom "ig..." en "cs..." (igphil -> csphil). Avec une tenue F7 sans version de
+// cinematique (igphil2, igpercy...), le modele n'existe pas : l'animation reste vide dans le groupe, et le
+// SET_CUTSCENE_ANIM suivant plantait en la lisant (0x401212, vu chez un invite en tenue igphil2). Le temps de ces deux
+// commandes, le modele 0 s'appelle "player" : Tommy joue la cinematique avec son corps habituel.
+static char g_savedPlayerName[24];
+static bool PlayerNameSwap(uint16_t op)
+{
+    if (op != 0x023C && op != 0x02E4) return false;
+    static int off = -1;   // test : TestSansCorrectifTenue=1 remet l'ancien comportement (pour reproduire le plantage)
+    if (off < 0) off = GetPrivateProfileIntA("VCCoop", "TestSansCorrectifTenue", 0, IniPath());
+    if (off) return false;
+    char *name = (char *)ModelName(0);
+    if (!name[0] || _strnicmp(name, "ig", 2) != 0) return false;
+    lstrcpynA(g_savedPlayerName, name, 21);
+    lstrcpynA(name, "player", 21);
+    Log("script : %04X avec la tenue %s : cinematique jouee avec le corps de Tommy", op, g_savedPlayerName);
+    return true;
+}
+static char RunOriginal(void *script, uint16_t op)
+{
+    bool swapped = PlayerNameSwap(op);
+    char r = (*o_ProcessOneCommand)(script);
+    if (swapped) lstrcpynA((char *)ModelName(0), g_savedPlayerName, 21);
+    return r;
+}
+
+char CallOriginalProcessOneCommand(void *script)
+{
+    uint16_t op = *(uint16_t *)(ScriptSpace() + Field<int>(script, 0x10)) & 0x7FFF;
+    return RunOriginal(script, op);
+}
+
+// Vehicules des missions secondaires : c'est en y etant (et en appuyant sur le bouton de mission) que le script
+// principal lance taxi, ambulance, pompiers, vigilante, pizzas. Aucune mission de l'histoire ne demarre ainsi.
+static bool InSideMissionVehicle()
+{
+    void *me = FindPlayerPed();
+    if (!me || !InVehicle(me) || !PedVehicle(me) || VehDriver(PedVehicle(me)) != me) return false;
+    // (pas "kaufman" : les missions d'histoire de Kaufman Cabs se lancent au volant d'un taxi Kaufman)
+    static const char *const names[] = { "taxi", "cabbie", "zebra", "ambulan", "firetruk", "police", "enforcer",
+                                         "fbiranch", "vicechee", "predator", "hunter", "rhino", "barracks", "polmav", "pizzaboy" };
+    const char *m = ModelName(ModelIndex(PedVehicle(me)));
+    for (const char *n : names) if (_stricmp(m, n) == 0) return true;
+    return false;
+}
+
+static bool g_sideMission, g_buyMission;
+bool GuestSideMission() { return g_sideMission; }
+static bool PropertyBuyPending();
+// Invite : peut-il lancer une mission ? Seulement les secondaires (au volant du bon vehicule) et l'achat d'un immeuble ;
+// les missions de l'histoire, c'est l'hote (conditions.cpp coupe CAN_PLAYER_START_MISSION pour le reste).
+// Defis (IsChallengeMission) : le fil du script principal verifie le modele et l'emplacement ; seuls ceux des
+// helicopteres (HELI1..4, Chopper Checkpoint) demandent aussi CAN_PLAYER_START_MISSION : au volant d'un Maverick.
+static bool InChallengeHeli()
+{
+    void *me = FindPlayerPed();
+    return me && InVehicle(me) && PedVehicle(me) && VehDriver(PedVehicle(me)) == me && ModelIndex(PedVehicle(me)) == 199;
+}
+bool GuestMayStartMission() { return InSideMissionVehicle() || PropertyBuyPending() || InChallengeHeli(); }
+
+// Numero de mission de LOAD_AND_LAUNCH_MISSION (0417) a l'adresse ip, sans executer la commande.
+static int MissionNumberAt(int ip)
+{
+    uint8_t *ss = ScriptSpace();
+    int at = ip + 2;
+    switch (ss[at]) {
+    case 1: return *(int32_t *)(ss + at + 1);
+    case 2: return *(int32_t *)(ss + *(uint16_t *)(ss + at + 1));
+    case 4: return (int8_t)ss[at + 1];
+    case 5: return *(int16_t *)(ss + at + 1);
+    }
+    return -1;
+}
+
+// --- Achat d'immeubles par l'invite ---
+// Les icones d'immeuble (CREATE_PROTECTION_PICKUP 0517 verrouillee / 0518 a vendre) sont creees par le script
+// principal et INITIAL de chaque machine ; leur reference est ecrite dans une globale. Quand l'invite en ramasse
+// une, son script principal lance la mission d'achat (BUYPRO1..SKUMBUY) : elle tourne chez lui, avec son argent,
+// et ecrit ses propres drapeaux de possession (gardes par overlay.cpp).
+static uint32_t g_propPickups[32];
+static int g_propAt;
+static uint32_t g_propCollectedAt;
+bool IsPropertyPickup(uint32_t handle) { for (uint32_t h : g_propPickups) if (h && h == handle) return true; return false; }
+void RegisterPropertyPickup(uint32_t handle) { if (!IsPropertyPickup(handle)) g_propPickups[g_propAt++ % 32] = handle; }
+void NotePropertyCollected() { g_propCollectedAt = GetTickCount(); }
+static bool PropertyBuyPending() { return g_propCollectedAt && GetTickCount() - g_propCollectedAt < 3000; }
+
+// Position du dernier parametre (la sortie) d'une commande a n parametres, -1 si ce n'est pas une globale.
+static int LastGlobalParam(int ip, int n)
+{
+    uint8_t *ss = ScriptSpace();
+    int at = ip + 2;
+    for (int i = 0; i < n; i++) {
+        uint8_t t = ss[at];
+        if (i == n - 1) return t == 2 ? *(uint16_t *)(ss + at + 1) : -1;
+        switch (t) {
+        case 1: case 6: at += 5; break;
+        case 2: case 3: case 5: at += 3; break;
+        case 4: at += 2; break;
+        default: at += 8; break;   // etiquette
+        }
+    }
+    return -1;
+}
+
+// --- Conditions "en voiture" remplies par un invite (conditions.cpp) ---
+// "Monte dans une voiture" (IS_PLAYER_IN_ANY_CAR 00E0) peut etre rempli par un invite alors que l'hote est a pied. Le
+// script prend ensuite "la voiture du joueur" (STORE_CAR_PLAYER_IS_IN 00DA / 03C1, STORE_CAR_CHAR_IS_IN 00D9 / 03C0
+// sur $PLAYER_ACTOR) : sans voiture, le jeu y ecrivait une reference fausse, et la commande suivante qui la lisait
+// plantait (LOCATE_PLAYER_*_CAR 01FC-0201 : 0x46352F, lawyer1, JD le 29/09, ejecte de la moto de l'invite). On lui
+// donne la voiture de l'invite (sa copie chez l'hote) le temps de la commande.
+static void *GuestCarForHost()
+{
+    void *me = FindPlayerPed(), *best = NULL;
+    float bestD = 1e12f;
+    for (int i = 1; i < MAX_PLAYERS; i++) {
+        const NetPlayer &n = g_players[i];
+        if (!n.connected || !n.state.inGame || !n.state.inVehicle) continue;
+        void *v = NetVehicleById(n.state.vehicleId);
+        if (!v) continue;
+        float dx = Pos(v).x - Pos(me).x, dy = Pos(v).y - Pos(me).y, d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; best = v; }
+    }
+    return best;
+}
+
+static bool VehicleRefValid(uint32_t h)
+{
+    Pool *vp = VehiclePool();
+    int i = (int)(h >> 8);
+    return i >= 0 && i < vp->size && vp->flags[i] == (uint8_t)(h & 0xFF) && !(vp->flags[i] & 0x80);
+}
+
+static char __fastcall h_ProcessOneCommand(void *script)
+{
+    int ip = Field<int>(script, 0x10);
+    uint16_t op = *(uint16_t *)(ScriptSpace() + ip) & 0x7FFF;
+    if (!g_cfg.host && op == OP_TERMINATE_THIS_SCRIPT && Field<bool>(script, 0x85) && g_sideMission) {
+        g_sideMission = false;
+        Log("script : fin de la mission secondaire (%.8s)", (char *)script + 8);
+    }
+    if (!g_cfg.host && op == OP_TERMINATE_THIS_SCRIPT && Field<bool>(script, 0x85) && g_buyMission) {
+        g_buyMission = false;
+        OverlayBuyEnd();
+    }
+    bool challenge = !g_cfg.host && op == OP_START_MISSION && !Field<bool>(script, 0x85) && IsChallengeMission(MissionNumberAt(ip));
+    bool sideWanted = !g_cfg.host && op == OP_START_MISSION && (challenge || InSideMissionVehicle());
+    if (sideWanted && !g_sideMission && HostOnMission() && !PropertyBuyPending()) {
+        static uint32_t lastRefused;
+        if (GetTickCount() - lastRefused > 5000) { Log("script : mission secondaire refusee a l'invite (%.8s) : l'hote est en mission", (char *)script + 8); lastRefused = GetTickCount(); }
+        sideWanted = false;   // la commande est sautee plus bas, comme une mission de l'histoire
+    }
+    if (!g_cfg.host && op == OP_START_MISSION && !g_sideMission && (sideWanted || PropertyBuyPending())) {
+        g_sideMission = true;
+        g_buyMission = !challenge && PropertyBuyPending() && !InSideMissionVehicle();
+        g_propCollectedAt = 0;
+        if (g_buyMission) OverlayBuyStart();
+        Log("script : l'invite lance une mission %s (par %.8s)", g_buyMission ? "d'achat d'immeuble" : "secondaire", (char *)script + 8);
+        return RunOriginal(script, op);
+    }
+    if (!g_cfg.host && (op == 0x0517 || op == 0x0518)) {   // icone d'immeuble : on retient sa reference
+        int gofs = LastGlobalParam(ip, op == 0x0517 ? 5 : 6);
+        char r = RunOriginal(script, op);
+        if (gofs > 0) { g_propPickups[g_propAt++ % 32] = *(uint32_t *)(ScriptSpace() + gofs); if (g_cfg.logScripts) Log("script : icone d'immeuble %08X (globale %d)", g_propPickups[(g_propAt - 1) % 32], gofs / 4); }
+        return r;
+    }
+    if (!g_cfg.host && op == OP_START_MISSION) {
+        static uint32_t lastLog;
+        Field<int>(script, 0x10) = ip + 2;
+        CollectParameters(script, 1);
+        // INITIAL (mission 0) : pas une mission d'histoire mais la mise en place du monde (generateurs de voitures
+        // garees, pickups, marqueurs des boutiques, objets) : chaque invite la joue lui-meme.
+        if (*(int *)0x7D7438 == 0) {
+            Field<int>(script, 0x10) = ip;
+            Log("script : l'invite joue INITIAL lui-meme");
+            return RunOriginal(script, op);
+        }
+        uint32_t now = GetTickCount();
+        if (now - lastLog > 5000) {
+            Log("script : mission %d non lancee chez l'invite (%.8s)", *(int *)0x7D7438, (char *)script + 8);
+            lastLog = now;
+        }
+        return 0;
+    }
+    // Diagnostic JournalOpcodes=2 : compte les opcodes de tous les scripts pendant 15 s apres la 2e fin de mission.
+    if (g_cfg.logOpcodes == 2) {
+        static uint32_t counts[0x800], start;
+        static int ends;
+        static bool dumped;
+        if (op == OP_TERMINATE_THIS_SCRIPT && Field<bool>(script, 0x85) && ++ends == 2) start = GetTickCount();
+        if (start && !dumped) {
+            if (op < 0x800) counts[op]++;
+            if (GetTickCount() - start > 15000) {
+                dumped = true;
+                char line[2048];
+                int n = wsprintfA(line, "opcodes apres l'intro :");
+                for (int i = 0; i < 0x800 && n < 2000; i++) if (counts[i]) n += wsprintfA(line + n, " %04X:%u", i, counts[i]);
+                Log("%s", line);
+            }
+        }
+    }
+    static int logged;                       // trace remise a zero a chaque lancement de mission
+    if (op == OP_START_MISSION) logged = 0;
+    if (g_cfg.logOpcodes == 1 && Field<bool>(script, 0x85)) {
+        if (logged < 4000) {
+            logged++;
+            char hex[64];
+            for (int i = 0; i < 20; i++) wsprintfA(hex + i * 3, "%02X ", ScriptSpace()[ip + 2 + i]);
+            Log("op %04X @%X (%.8s) %s", op, ip, (char *)script + 8, hex);
+        }
+    }
+    // Diagnostic : textes d'aide / messages affiches par n'importe quel script (etiquette, script, position).
+    if (g_cfg.logScripts && (op == 0x03E5 || op == 0x00BC || op == 0x00BB)) {
+        static char last[9];
+        const char *label = (const char *)ScriptSpace() + ip + 2;
+        if (memcmp(last, label, 8) != 0) {
+            memcpy(last, label, 8);
+            void *me = FindPlayerPed();
+            Log("script : %04X '%.8s' par %.8s (mission %d) joueur en %.1f %.1f, modele 0 '%s'", op, label,
+                (char *)script + 8, Field<bool>(script, 0x85), me ? Pos(me).x : 0.0f, me ? Pos(me).y : 0.0f, ModelName(0));
+        }
+    }
+    // Diagnostic TraceScript=nom : chaque opcode d'un script nomme, avec ses octets (6000 au plus).
+    if (g_cfg.traceScript[0] && !_strnicmp((char *)script + 8, g_cfg.traceScript, 8)) {
+        static int traced;
+        if (traced++ < 6000) {
+            char hex[64];
+            for (int i = 0; i < 20; i++) wsprintfA(hex + i * 3, "%02X ", ScriptSpace()[ip + 2 + i]);
+            Log("trace %04X @%X %s", op, ip, hex);
+        }
+    }
+    ConditionsBeginCommand(script, op);
+    // Voiture du joueur demandee alors que l'hote est a pied (condition remplie par un invite) : celle de l'invite.
+    if (g_cfg.host && (op == 0x00DA || op == 0x03C1 || op == 0x00D9 || op == 0x03C0)) {
+        void *me = FindPlayerPed();
+        bool aboutHost = false;
+        if (me && !InVehicle(me)) {
+            uint8_t *ss = ScriptSpace();
+            int at = ip + 2;
+            int32_t first = ss[at] == 4 ? (int8_t)ss[at + 1] : ss[at] == 5 ? *(int16_t *)(ss + at + 1) : ss[at] == 1 ? *(int32_t *)(ss + at + 1)
+                          : ss[at] == 2 ? *(int32_t *)(ss + *(uint16_t *)(ss + at + 1)) : ss[at] == 3 ? Field<int32_t>(script, 0x30 + *(uint16_t *)(ss + at + 1) * 4) : -1;
+            aboutHost = (op == 0x00DA || op == 0x03C1) ? first == 0 : (uint32_t)first == PedHandle(me);
+        }
+        void *car = aboutHost ? GuestCarForHost() : NULL;
+        if (aboutHost && !car && !PedVehicle(me)) {
+            // Ni voiture a nous ni a un invite : on ecrit une voiture "aucune" ; LOCATE_*_CAR est garde plus bas.
+            Log("script : %04X sans voiture (%.8s), commande laissee", op, (char *)script + 8);
+        }
+        if (car) {
+            void *saved = PedVehicle(me);
+            PedVehicle(me) = car;
+            char r = RunOriginal(script, op);
+            PedVehicle(me) = saved;
+            Log("script : %04X (%.8s) : l'hote est a pied, voiture de l'invite (%08X) prise a sa place", op, (char *)script + 8, NetVehicleId(car));
+            return r;
+        }
+    }
+    // LOCATE_PLAYER_*_CAR_2D / 3D (01FC-0201 : joueur, voiture, rayons, [z], cylindre) : le jeu ne verifie pas la
+    // voiture ; une reference morte plantait (0x46352F). Voiture absente : condition fausse, commande sautee.
+    if (op >= 0x01FC && op <= 0x0201) {
+        Field<int>(script, 0x10) = ip + 2;
+        CollectParameters(script, op >= 0x01FF ? 6 : 5);
+        uint32_t car = ((uint32_t *)0x7D7438)[1];
+        if (!VehicleRefValid(car)) {
+            Field<bool>(script, 0x82) = (*(uint16_t *)(ScriptSpace() + ip) & 0x8000) != 0;   // m_bNotFlag, comme le jeu
+            ((void(__thiscall *)(void *, uint8_t))0x463F00)(script, 0);   // CRunningScript::UpdateCompareFlag
+            static uint32_t lastLog;
+            if (GetTickCount() - lastLog > 5000) {
+                lastLog = GetTickCount();
+                char hex[80];
+                for (int i = 0; i < 24; i++) wsprintfA(hex + i * 3, "%02X ", ScriptSpace()[ip + i]);
+                Log("script : %04X avec une voiture inexistante (%08X, %.8s @%X, suite %X) : condition fausse ; %s", op, car, (char *)script + 8, ip,
+                    Field<int>(script, 0x10), hex);
+            }
+            return 0;
+        }
+        Field<int>(script, 0x10) = ip;
+    }
+    MainMapCmd mapCmd = StoryMapBefore(script, ip, op);
+    if (g_cfg.host) {
+        if (op == OP_TERMINATE_THIS_SCRIPT && Field<bool>(script, 0x85)) MirrorMissionEnd();
+        if (op == OP_START_MISSION) {
+            int at = ip + 2, n = 0;
+            uint8_t t = ScriptSpace()[at];
+            if (t == 4) n = (int8_t)ScriptSpace()[at + 1];
+            else if (t == 5) n = *(int16_t *)(ScriptSpace() + at + 1);
+            else if (t == 1) n = *(int32_t *)(ScriptSpace() + at + 1);
+            else if (t == 2) n = *(int32_t *)(ScriptSpace() + *(uint16_t *)(ScriptSpace() + at + 1));
+            MirrorMissionStart(n);
+            Log("script : l'hote lance la mission %d (%.8s)", n, (char *)script + 8);
+        }
+        if (MirrorBefore(script, ip, op)) {
+            char r = RunOriginal(script, op);
+            MirrorAfter(script);
+            StoryMapAfter(script, mapCmd);
+            return r;
+        }
+        char r = RunOriginal(script, op);
+        ConditionsAfterCommand(script, op, ip);
+        StoryMapAfter(script, mapCmd);
+        return r;
+    }
+    char r = RunOriginal(script, op);
+    StoryMapAfter(script, mapCmd);
+    return r;
+}
+
+void InstallScriptHooks()
+{
+    static const uint8_t prologue[] = { 0x66, 0xFF, 0x05, 0x66, 0x0A, 0xA1, 0x00 };
+    if (memcmp((void *)0x44FBE0, prologue, sizeof(prologue)) != 0) {
+        Log("script : prologue inattendu, crochet non pose");
+        return;
+    }
+    uint8_t *tramp = (uint8_t *)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    memcpy(tramp, prologue, sizeof(prologue));
+    tramp[7] = 0xE9;
+    *(int32_t *)(tramp + 8) = (int32_t)(0x44FBE7 - ((uintptr_t)tramp + 12));
+    o_ProcessOneCommand = (ProcessOneCommand_t)tramp;
+    PatchJump(0x44FBE0, (void *)h_ProcessOneCommand, 7);
+}

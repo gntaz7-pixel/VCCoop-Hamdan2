@@ -1,0 +1,178 @@
+// Reseau VCCoop : UDP, un hote et jusqu'a MAX_PLAYERS-1 invites. L'hote relaie l'etat de chacun a tous.
+#pragma once
+#include <stdint.h>
+
+enum { MAX_PLAYERS = 4, NET_VERSION = 21 };
+
+enum MsgType : uint8_t {
+    MSG_HELLO = 1,   // invite -> hote : je veux entrer (nom)
+    MSG_WELCOME,     // hote -> invite : ton numero de joueur
+    MSG_FULL,        // hote -> invite : partie pleine ou version differente
+    MSG_STATE,       // etat d'un joueur (invite -> hote, puis hote -> tous)
+    MSG_BYE,         // depart d'un joueur
+    MSG_WORLD,       // hote -> invites : heure et meteo (1 fois par seconde)
+    MSG_VEHICLE,     // etat d'un vehicule reseau, envoye par son proprietaire (relaye par l'hote)
+    MSG_VEH_REMOVE,  // le vehicule n'existe plus chez son proprietaire
+    MSG_PED,         // hote -> invites : personnage de mission
+    MSG_PED_REMOVE,  // hote -> invites : personnage de mission disparu
+    MSG_RELIABLE,    // enveloppe fiable et ordonnee : seq + charge utile (voir NetSendReliable)
+    MSG_ACK,         // accuse de reception cumulatif d'un flux fiable
+    MSG_MARKER,      // hote -> invites : cylindre de destination d'une mission (conditions.cpp)
+    MSG_PING,        // invite -> hote : heure d'envoi (mesure du ping)
+    MSG_PONG,        // hote -> invite : la meme heure, renvoyee
+    MSG_RDV,         // point de rendez-vous d'un joueur (players.cpp), relaye par l'hote
+    MSG_TIMERS,      // hote -> invites : valeur des minuteurs / compteurs de mission a l'ecran (mirror.cpp)
+    MSG_RESYNC,      // hote -> invite : ton flux fiable est perdu, reconnecte-toi (nouvelle session, tout est renvoye)
+    MSG_CORONA,      // hote -> invites : cercle lumineux d'une mission (DRAW_CORONA, checkpoints) (conditions.cpp)
+    MSG_RAGDOLL,     // pose du corps mou d'un personnage, par son proprietaire (ragdoll.cpp), relaye par l'hote
+};
+// Refus : reason 1 = partie pleine, 2 = version differente (hostVersion = la sienne).
+struct MsgFull { uint8_t type, reason, hostVersion; };
+struct MsgPing { uint8_t type; uint32_t time; };
+struct MsgRdv { uint8_t type, player, active; float pos[3]; };
+
+#pragma pack(push, 1)
+// rejoin : l'invite etait deja dans cette partie (coupure reseau) : pas besoin de lui renvoyer la sauvegarde.
+// session : tire au sort par l'invite a chaque (re)connexion ; l'hote repart d'un flux fiable neuf quand il change.
+struct MsgHello { uint8_t type, version; char name[24]; uint8_t rejoin; uint32_t session; };
+struct MsgWelcome { uint8_t type, id; };
+struct MsgBye { uint8_t type, id; };
+
+// Animation "d'action" (tout sauf marcher / courir / attendre), rejouee sur la copie du personnage chez les autres.
+struct AnimSlot { int16_t id; uint8_t group, blend; float time; };   // id -1 : aucune
+
+// Etat d'un joueur, envoye ~30 fois par seconde.
+struct MsgState {
+    uint8_t type, id;
+    uint8_t inGame;     // en partie (sinon au menu / en chargement)
+    uint8_t area;       // interieur (m_nAreaCode)
+    uint32_t seq;
+    float pos[3];
+    float speed[3];
+    float heading;
+    float health, armour;
+    uint8_t moveState, pedState, inVehicle, weapon;
+    uint32_t vehicleId;  // vehicule reseau occupe (0 = aucun)
+    uint8_t seat;        // 0 = conducteur
+    char outfit[21];     // tenue : nom du modele 0 chez ce joueur ("player", "play4"...)
+    float fade;          // niveau du fondu de sa camera (l'hote fait foi pour les invites)
+    uint8_t shots;       // compteur de tirs (chaque nouveau tir est rejoue en visuel chez les autres)
+    uint8_t aiming;      // vise (bras leve)
+    char name[24];
+    uint32_t time;       // GetTickCount de l'envoi (interpolation, interp.cpp)
+    AnimSlot anims[3];   // animations en cours hors marche (coups, sauts, chutes...), les plus visibles d'abord
+    uint8_t shared;      // invite : il voit les passants et la circulation de l'hote (population.cpp)
+    uint16_t ping;       // invite : aller-retour avec l'hote (ms)
+    uint8_t wanted;      // etoiles de recherche
+    uint32_t enterId;    // vehicule reseau dans lequel il est en train de monter (animation en cours chez lui), 0 sinon
+    uint8_t exiting;     // en train de descendre (animation en cours)
+    uint8_t enterSeat;   // 0 : au volant, 1 : passager
+    uint8_t modsPct;     // invite : mods de l'hote telecharges (%)
+    uint8_t animGroup;   // groupe d'animation de son Tommy (player, player2armed, playerbbbat... : demarche de Tommy, pas d'un passant)
+    uint8_t cutscene;    // une cinematique tourne chez lui (son double est cache pendant ce temps chez les autres)
+    uint8_t down;        // mort ou arrete (fondu de son ecran a ne pas suivre, double sans collision)
+};
+struct MsgWorld {
+    uint8_t type;
+    uint8_t hours, minutes, seconds;
+    short oldWeather, newWeather, forcedWeather;
+    uint32_t playerHandle;   // reference de pool du Tommy de l'hote (pour traduire les commandes qui le visent)
+    float fade;              // niveau du fondu de la camera de l'hote (0 = image claire, 255 = noir)
+    uint8_t fading, widescreen;
+    uint8_t friendlyFire;    // les joueurs peuvent se blesser entre eux (reglage TirAmi de l'hote)
+    uint8_t zonePop;         // ZonePopulation de l'hote (%) : tout le monde calcule la meme zone de l'hote
+    uint16_t popDensity;     // DensitePopulation de l'hote (%) : meme densite partout
+};
+// Vehicule reseau : identifiant = (numero du joueur qui l'a cree << 24) | compteur.
+struct MsgVehicle {
+    uint8_t type, owner, driver, vclass;   // driver : numero du joueur au volant, 0xFF sinon
+    uint32_t id;
+    uint16_t model;
+    uint8_t color1, color2;
+    float pos[3], right[3], fwd[3], speed[3], turn[3];
+    float health, steer, gas, brake;
+    uint32_t poolHandle;     // reference de pool chez le proprietaire (traduction des commandes de l'hote)
+    uint32_t time;           // GetTickCount de l'envoi
+    float wheelSpin[4];      // rotation des roues par 1/50 s (moto : avant, arriere)
+    uint8_t radio;           // station de radio (m_nRadioStation +0x23C) : celle du conducteur pour tout le monde
+    uint8_t damage[24];      // voitures : CDamageManager (+0x2A0) du proprietaire (portes, ailes, phares, pneus...)
+    uint8_t ambient;         // circulation partagee (ignoree par un invite qui a son propre monde)
+    uint8_t wrecked;         // epave chez le proprietaire (la copie explose aussi)
+    uint8_t vflags;          // 1 phares, 2 moteur, 4 sirene/gyrophare, 8 klaxon, 16 lumiere de taxi
+    int8_t doorLock;         // m_nDoorLock (+0x230) : une copie verrouillee comme l'original
+    float lean, pedLean;     // moto : inclinaison (CBike +0x46C) et penchement du pilote (+0x478)
+    int8_t extras[2];        // pieces en option tirees au hasard par le jeu (capote, galerie... : m_aExtras +0x1A2)
+};
+struct MsgVehRemove { uint8_t type; uint32_t id; };
+
+// Personnage de mission de l'hote, identifie par sa reference de pool chez l'hote.
+struct MsgPed {
+    uint8_t type, moveState, pedState, pedType;
+    uint32_t handle;
+    uint16_t model;
+    uint8_t area, seat;
+    uint32_t vehicleId;     // vehicule reseau occupe (0 = a pied)
+    float pos[3], speed[3];
+    float heading, health;
+    int32_t weapon;         // type d'arme en main
+    char modelName[21];     // pour les personnages speciaux (Lance, Ken...)
+    uint32_t time;          // GetTickCount de l'envoi
+    AnimSlot anims[2];      // animations d'action (se battre, tomber, se relever...)
+    uint8_t owner;          // joueur dont c'est le personnage (0 = hote ; un invite recherche envoie sa police)
+    uint8_t ambient;        // passant (population partagee), pas un personnage de mission
+    uint8_t shots;          // compteur de tirs (chaque nouveau tir est rejoue sur la copie : ses balles font mal)
+    uint32_t enterId;       // vehicule reseau ou il est en train de monter (animation du jeu), 0 sinon
+    uint8_t enterSeat;      // 0 volant, 1 passager
+    uint8_t exiting;        // en train de descendre (animation du jeu)
+};
+struct MsgPedRemove { uint8_t type; uint32_t handle; uint8_t owner; };
+#pragma pack(pop)
+
+struct NetPlayer {
+    bool connected;
+    MsgState state;     // dernier etat recu
+    uint32_t lastSeen;  // GetTickCount de la derniere reception (signes de vie compris)
+    uint32_t lastStateAt;   // GetTickCount du dernier MSG_STATE (un joueur fige ne remplit plus les conditions)
+    uint32_t lastSeq;   // numero du dernier etat applique (les etats arrives dans le desordre sont ignores)
+};
+
+extern NetPlayer g_players[MAX_PLAYERS];
+extern int g_localId;   // 0 = hote ; -1 = invite pas encore accepte
+
+bool NetStart();        // selon g_cfg (hote ou invite)
+void NetStop();         // ferme le salon / se deconnecte : previent les autres, ferme la connexion
+void NetPoll();         // lit tous les paquets en attente
+void NetSendState(const MsgState &s);
+void NetSendBye();      // on quitte : previent l'hote (ou tous les invites) tout de suite, sans attendre le delai
+void NetKeepAlive();    // signe de vie envoye depuis un autre fil (watchdog.cpp), meme si le jeu ne presente plus d'image
+void NetSendToGuests(const void *data, int len);   // hote seulement
+extern void (*g_onWorld)(const MsgWorld &w);       // invite : appele a la reception d'un MsgWorld
+extern void (*g_onState)(const MsgState &s);       // chaque etat de joueur recu (pour son interpolation)
+extern void (*g_onVehicle)(const MsgVehicle &v);
+extern void (*g_onVehRemove)(uint32_t id);
+extern void (*g_onPed)(const MsgPed &p);
+extern void (*g_onPedRemove)(uint8_t owner, uint32_t handle);
+void NetSendToAll(const void *data, int len);      // hote : a tous les invites ; invite : a l'hote (qui relaie)
+
+// Flux fiable et ordonne (renvoye jusqu'a accuse de reception). Hote : vers chaque invite ; invite : vers l'hote.
+// La charge utile commence par son propre octet de type (RL_*).
+enum { MAX_RELIABLE_PAYLOAD = 480 };
+void NetSendReliable(const void *data, int len);
+void NetSendReliableTo(int peer, const void *data, int len);   // hote : a un invite precis
+extern void (*g_onReliable)(int from, const uint8_t *data, int len);
+extern void (*g_onJoin)(int peer);   // hote : un invite vient d'entrer
+extern bool g_peerRejoin[MAX_PLAYERS]; // hote : cet invite revient d'une coupure (deja en partie avec nous)
+extern void (*g_onNotice)(const char *fr, const char *en, int player);   // message a l'ecran (players.cpp)
+extern uint16_t g_myPing;
+extern void (*g_onRdv)(const MsgRdv &r);   // point de rendez-vous recu (players.cpp)   // invite : dernier aller-retour mesure avec l'hote (ms)
+bool NetIsHost();
+// Hote : un invite en partie est-il a moins de r metres de p (meme interieur) ?
+bool NearAnyGuest(const float *p, uint8_t area, float r);
+// Un AUTRE joueur (hote ou invite) en partie est-il a moins de r metres de p (meme interieur) ?
+bool NearOtherPlayer(const float *p, uint8_t area, float r);
+// Distances de la population partagee : l'invite la rejoint a SHARE_ENTER_M de l'hote, la quitte a SHARE_LEAVE_M ;
+// l'hote lui envoie alors ses passants et sa circulation jusqu'a AMBIENT_SHARE_M autour de lui.
+enum { SHARE_ENTER_M = 150, SHARE_LEAVE_M = 210, AMBIENT_SHARE_M = 260 };
+// Zone ou l'hote peuple le monde (sa portee de generation : passants, circulation, voitures garees a 90-110 m).
+// Au-dela, chaque invite peuple le sien et le partage ; une entite recue de plus loin que AMBIENT_DROP_M est ignoree.
+enum { HOST_ZONE_M = 110, AMBIENT_DROP_M = 330 };   // HOST_ZONE_M : a ZonePopulation=100 (HostZoneM)
