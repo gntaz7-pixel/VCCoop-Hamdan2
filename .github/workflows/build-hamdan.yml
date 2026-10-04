@@ -1,0 +1,107 @@
+name: Build VCCoop Hamdan DLL (Win32)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-hamdan.yml'
+      - 'src/**'
+      - 'tests/**'
+      - 'build_NPC_fix.cmd'
+      - 'VCCoop_Hamdan_GitHub_Ready/**'
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Run four portable tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find project (repository root or legacy subfolder)
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f src/dinput8.def && -f build_NPC_fix.cmd ]]; then
+            dir='.'
+          elif [[ -f VCCoop_Hamdan_GitHub_Ready/src/dinput8.def && -f VCCoop_Hamdan_GitHub_Ready/build_NPC_fix.cmd ]]; then
+            dir='VCCoop_Hamdan_GitHub_Ready'
+          else
+            echo 'ERROR: Could not locate VCCoop src and build_NPC_fix.cmd.' >&2
+            find . -maxdepth 3 -name 'build_NPC_fix.cmd' -print || true
+            exit 1
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "Compiling project at $dir"
+      - name: Test enemy targeting, mission death, map, and running speed
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          for test in mission_targeting_test guest_mission_death_test story_map_policy_test run_speed_policy_test; do
+            echo "=== $test ==="
+            g++ -std=c++11 -O2 -Wall -Wextra -Werror "tests/${test}.cpp" -o "/tmp/${test}"
+            "/tmp/${test}"
+          done
+
+  dll:
+    name: Compile Win32 DLL and package Hamdan UI
+    needs: tests
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find project (repository root or legacy subfolder)
+        id: project
+        shell: pwsh
+        run: |
+          if ((Test-Path 'src/dinput8.def') -and (Test-Path 'build_NPC_fix.cmd')) {
+            'dir=.' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } elseif ((Test-Path 'VCCoop_Hamdan_GitHub_Ready/src/dinput8.def') -and (Test-Path 'VCCoop_Hamdan_GitHub_Ready/build_NPC_fix.cmd')) {
+            'dir=VCCoop_Hamdan_GitHub_Ready' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            throw 'Could not locate VCCoop source; ensure the files are unzipped in the repository.'
+          }
+      - name: Build x86 DLL with Visual Studio 2022
+        shell: cmd
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: call build_NPC_fix.cmd
+      - name: Verify DLL and prepare ready-to-copy files
+        shell: pwsh
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE $env:PROJECT_DIR
+          $dll = Join-Path $src 'build/dinput8.dll'
+          if (-not (Test-Path $dll)) { throw 'Compiler did not produce dinput8.dll' }
+          $bytes = [System.IO.File]::ReadAllBytes($dll)
+          if ($bytes.Length -lt 512 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw 'Invalid Windows DLL (MZ header)' }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($pe -lt 64 -or ($pe + 26) -ge $bytes.Length) { throw 'Invalid Windows PE offset' }
+          if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) { throw 'Invalid PE signature' }
+          if ([BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x014c) { throw 'Expected x86 DLL, received different architecture' }
+          if (([BitConverter]::ToUInt16($bytes, $pe + 22) -band 0x2000) -eq 0) { throw 'PE is not a DLL' }
+          $out = Join-Path $env:GITHUB_WORKSPACE 'release'
+          $ui = Join-Path $out 'VCCoop/interface'
+          New-Item -Path $ui -ItemType Directory -Force | Out-Null
+          Copy-Item -LiteralPath $dll -Destination (Join-Path $out 'dinput8.dll') -Force
+          $assetDir = Join-Path $src 'dist/files/VCCoop/interface'
+          if (-not (Test-Path (Join-Path $assetDir 'launcher.png'))) { throw 'Hamdan UI assets missing' }
+          Copy-Item -Path (Join-Path $assetDir '*') -Destination $ui -Recurse -Force
+          foreach ($name in @('README_INSTALL_AR.txt', 'HAMDAN-vccoop-options.ini')) {
+            $file = Join-Path $src $name
+            if (Test-Path $file) { Copy-Item -LiteralPath $file -Destination $out -Force }
+          }
+          $hash = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash
+          Set-Content -Path (Join-Path $out 'DLL-SHA256.txt') -Value "$hash  dinput8.dll" -Encoding ascii
+          Write-Host "Win32 DLL verified; SHA256: $hash"
+      - name: Upload install package
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCCoop-Hamdan-Install-Win32
+          path: release/**
+          if-no-files-found: error
+          retention-days: 14
